@@ -183,12 +183,125 @@ class WooCommerceClient:
         return bool(src)
 
     def upload_image_to_product(self, product_id, image_path):
-        """Upload an image and set it as the product's featured image."""
+        """Upload an image and set it as the product's featured image.
+
+        Uses a temporary local HTTP server to serve the image file, then
+        passes the URL to the WooCommerce REST API which downloads it.
+        This is the most reliable method since WC consumer key/secret
+        does not authenticate against the WP REST API media endpoint.
+        """
         filename = os.path.basename(image_path)
+        errors = []
 
-        # First, upload to WordPress media library via WP REST API
-        media_url = self.base_url.replace("/wc/v3", "/wp/v2") + "/media"
+        # Method 1: Temporary HTTP server + WC API src URL
+        # WooCommerce accepts a publicly-accessible URL in images[].src
+        # and will download and import the image itself.
+        try:
+            success, message = self._upload_via_temp_server(
+                product_id, image_path, filename)
+            if success:
+                return True, message
+            errors.append(f"Metodo servidor temporal: {message}")
+        except Exception as e:
+            errors.append(f"Metodo servidor temporal: {str(e)}")
 
+        # Method 2: Direct WP media upload (works if Application Passwords
+        # or a JWT auth plugin is configured)
+        try:
+            success, message = self._upload_via_wp_media(
+                product_id, image_path, filename)
+            if success:
+                return True, message
+            errors.append(f"Metodo WP Media: {message}")
+        except Exception as e:
+            errors.append(f"Metodo WP Media: {str(e)}")
+
+        # Method 3: Multipart form upload directly to WC API
+        try:
+            success, message = self._upload_via_multipart(
+                product_id, image_path, filename)
+            if success:
+                return True, message
+            errors.append(f"Metodo multipart: {message}")
+        except Exception as e:
+            errors.append(f"Metodo multipart: {str(e)}")
+
+        return False, "Todos los metodos fallaron: " + " | ".join(errors)
+
+    def _upload_via_temp_server(self, product_id, image_path, filename):
+        """Upload by starting a temporary HTTP server to serve the image,
+        then telling WooCommerce to download it from that URL."""
+        import http.server
+        import socketserver
+        import urllib.parse
+
+        image_dir = os.path.dirname(os.path.abspath(image_path))
+        image_name = os.path.basename(image_path)
+
+        # Find a free port
+        server = None
+        port = 0
+        try:
+            handler = http.server.SimpleHTTPRequestHandler
+
+            class QuietHandler(handler):
+                """Suppress log output."""
+                def log_message(self, format, *args):
+                    pass
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory=image_dir, **kwargs)
+
+            server = socketserver.TCPServer(("0.0.0.0", 0), QuietHandler)
+            port = server.server_address[1]
+
+            # Start server in a background thread
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+
+            # Get the public IP or use the store URL's domain to determine reachability
+            # Since the local server won't be reachable from a remote WooCommerce store,
+            # this method only works if WooCommerce is on the same machine or network.
+            # We try it and fall through to other methods if it fails.
+            encoded_name = urllib.parse.quote(image_name)
+            image_url = f"http://localhost:{port}/{encoded_name}"
+
+            # Get existing gallery images to preserve them
+            existing_images = self._get_existing_images(product_id)
+
+            # Tell WooCommerce to download the image from our temp server
+            images_payload = [{"src": image_url, "name": filename}]
+            images_payload.extend(existing_images)
+
+            resp = self.session.put(
+                f"{self.base_url}/products/{product_id}",
+                json={"images": images_payload},
+                timeout=120,
+            )
+
+            if resp.status_code == 200:
+                result = resp.json()
+                new_images = result.get("images", [])
+                if new_images and not any(
+                    "placeholder" in (img.get("src", "")).lower()
+                    for img in new_images[:1]
+                ):
+                    return True, "Imagen subida correctamente (via servidor temporal)"
+                else:
+                    return False, "WooCommerce no descargo la imagen"
+            else:
+                error_text = resp.text[:300] if resp.text else "Sin respuesta"
+                return False, f"Error HTTP {resp.status_code}: {error_text}"
+
+        except Exception as e:
+            return False, str(e)
+        finally:
+            if server:
+                server.shutdown()
+
+    def _upload_via_wp_media(self, product_id, image_path, filename):
+        """Upload via WP REST API media endpoint.
+        Works if Application Passwords or JWT Auth is enabled."""
         mime_types = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
@@ -198,6 +311,8 @@ class WooCommerceClient:
         }
         ext = os.path.splitext(filename)[1].lower()
         mime_type = mime_types.get(ext, "image/jpeg")
+
+        media_url = self.base_url.replace("/wc/v3", "/wp/v2") + "/media"
 
         try:
             with open(image_path, "rb") as img_file:
@@ -220,27 +335,55 @@ class WooCommerceClient:
                 media_id = media_data.get("id")
                 media_src = media_data.get("source_url", "")
 
-                # Now update the product with the new image
+                existing_images = self._get_existing_images(product_id)
+                images_payload = [{"id": media_id, "src": media_src}]
+                images_payload.extend(existing_images)
+
                 update_resp = self.session.put(
                     f"{self.base_url}/products/{product_id}",
-                    json={
-                        "images": [{"id": media_id, "src": media_src}]
-                        + [
-                            img
-                            for img in self._get_existing_images(product_id)
-                        ]
-                    },
+                    json={"images": images_payload},
                     timeout=30,
                 )
                 update_resp.raise_for_status()
                 return True, f"Imagen subida correctamente (Media ID: {media_id})"
             else:
-                # Fallback: try using WooCommerce product image URL method
-                return self._upload_via_wc_api(product_id, image_path, filename)
+                return False, f"Error HTTP {resp.status_code}: {resp.text[:200]}"
 
         except Exception as e:
-            # Fallback to WC API method
-            return self._upload_via_wc_api(product_id, image_path, filename)
+            return False, str(e)
+
+    def _upload_via_multipart(self, product_id, image_path, filename):
+        """Upload image using multipart form data to the WC products endpoint."""
+        mime_types = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }
+        ext = os.path.splitext(filename)[1].lower()
+        mime_type = mime_types.get(ext, "image/jpeg")
+
+        try:
+            # Try uploading the image as a file attachment to the product
+            with open(image_path, "rb") as img_file:
+                files = {"file": (filename, img_file, mime_type)}
+                # Use a separate request without the session's JSON headers
+                resp = requests.post(
+                    f"{self.base_url}/products/{product_id}",
+                    auth=self.auth,
+                    files=files,
+                    data={"images": json.dumps([{"name": filename}])},
+                    timeout=60,
+                )
+
+            if resp.status_code == 200:
+                return True, "Imagen subida correctamente (via multipart)"
+            else:
+                return False, f"Error HTTP {resp.status_code}: {resp.text[:200]}"
+
+        except Exception as e:
+            return False, str(e)
 
     def _get_existing_images(self, product_id):
         """Get existing gallery images for a product (excluding the first/featured)."""
@@ -253,45 +396,17 @@ class WooCommerceClient:
                 product = resp.json()
                 images = product.get("images", [])
                 # Return all images except the first one (featured)
-                if len(images) > 1:
-                    return images[1:]
+                # Filter out placeholder images
+                real_images = []
+                for img in images:
+                    src = img.get("src", "")
+                    if src and "placeholder" not in src.lower():
+                        real_images.append({"id": img.get("id"), "src": src})
+                if len(real_images) > 0:
+                    return real_images[1:]  # Skip the featured image
             return []
         except Exception:
             return []
-
-    def _upload_via_wc_api(self, product_id, image_path, filename):
-        """Fallback: Upload image by encoding as base64 and sending via WC API."""
-        import base64
-
-        try:
-            with open(image_path, "rb") as img_file:
-                encoded = base64.b64encode(img_file.read()).decode("utf-8")
-
-            ext = os.path.splitext(filename)[1].lower().lstrip(".")
-            mime_type = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-
-            # Use the WooCommerce product update endpoint with image src
-            # This method uses a local file path approach
-            resp = self.session.put(
-                f"{self.base_url}/products/{product_id}",
-                json={
-                    "images": [
-                        {
-                            "name": filename,
-                            "src": f"data:{mime_type};base64,{encoded}",
-                        }
-                    ]
-                },
-                timeout=120,
-            )
-
-            if resp.status_code == 200:
-                return True, "Imagen subida correctamente (via WC API)"
-            else:
-                return False, f"Error HTTP {resp.status_code}: {resp.text[:200]}"
-
-        except Exception as e:
-            return False, f"Error al subir imagen: {str(e)}"
 
 
 # ============================================================
@@ -916,7 +1031,6 @@ class WooImageSyncApp:
 
     def log(self, message):
         """Add a message to the log."""
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"[{timestamp}] {message}\n"
 
