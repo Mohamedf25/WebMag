@@ -26,6 +26,9 @@ class WIS_Ajax_Handler {
 
         // Process single image (for one-by-one processing)
         add_action( 'wp_ajax_wis_process_single', array( $this, 'handle_process_single' ) );
+
+        // Clear sync log
+        add_action( 'wp_ajax_wis_clear_log', array( $this, 'handle_clear_log' ) );
     }
 
     /**
@@ -219,6 +222,19 @@ class WIS_Ajax_Handler {
         $this->log_result( $result );
 
         wp_send_json_success( $result );
+    }
+
+    /**
+     * Handle clearing the sync log.
+     */
+    public function handle_clear_log() {
+        $this->verify_request();
+
+        delete_option( 'wis_sync_log' );
+
+        wp_send_json_success( array(
+            'message' => __( 'Registro limpiado correctamente.', 'woo-image-sync' ),
+        ) );
     }
 
     /**

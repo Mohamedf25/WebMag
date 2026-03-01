@@ -391,11 +391,37 @@ class WIS_Admin {
                     <div class="wis-card">
                         <h2><?php esc_html_e( 'Registro de Sincronizacion', 'woo-image-sync' ); ?></h2>
                         <div id="wis-log-container" class="wis-log-container">
-                            <p class="wis-log-empty"><?php esc_html_e( 'No hay registros de sincronizacion aun. Realiza una sincronizacion para ver los resultados aqui.', 'woo-image-sync' ); ?></p>
+                            <?php
+                            $log = get_option( 'wis_sync_log', array() );
+                            if ( ! empty( $log ) ) :
+                                // Show entries in reverse chronological order
+                                $log = array_reverse( $log );
+                                foreach ( $log as $entry ) :
+                                    $status_class = isset( $entry['status'] ) ? 'log-' . esc_attr( $entry['status'] ) : '';
+                                    ?>
+                                    <div class="wis-log-entry">
+                                        <span class="wis-log-time">[<?php echo esc_html( $entry['timestamp'] ); ?>]</span>
+                                        <span class="wis-log-status <?php echo esc_attr( $status_class ); ?>">
+                                            <?php echo esc_html( strtoupper( str_replace( '_', ' ', $entry['status'] ) ) ); ?>
+                                        </span>
+                                        <span class="wis-log-message"><?php echo esc_html( $entry['message'] ); ?></span>
+                                    </div>
+                                    <?php
+                                endforeach;
+                            else :
+                            ?>
+                                <p class="wis-log-empty"><?php esc_html_e( 'No hay registros de sincronizacion aun. Realiza una sincronizacion para ver los resultados aqui.', 'woo-image-sync' ); ?></p>
+                            <?php endif; ?>
                         </div>
+                        <?php if ( ! empty( $log ) ) : ?>
+                        <button type="button" id="wis-clear-log-btn" class="button">
+                            <?php esc_html_e( 'Limpiar Registro', 'woo-image-sync' ); ?>
+                        </button>
+                        <?php else : ?>
                         <button type="button" id="wis-clear-log-btn" class="button" style="display:none;">
                             <?php esc_html_e( 'Limpiar Registro', 'woo-image-sync' ); ?>
                         </button>
+                        <?php endif; ?>
                     </div>
                 </div>
 

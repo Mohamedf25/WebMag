@@ -337,40 +337,85 @@
             var self = this;
             this.isProcessing = true;
             this.showProgress();
-
             this.updateProgress(0, wisAjax.strings.syncing);
 
+            // First scan to get the list of images, then process one by one
             $.post(wisAjax.ajaxUrl, {
-                action: 'wis_sync_server',
+                action: 'wis_scan_folder',
                 nonce: wisAjax.nonce
             }, function (response) {
-                self.isProcessing = false;
-
                 if (!response.success) {
+                    self.isProcessing = false;
                     self.updateProgress(100, response.data.message);
                     return;
                 }
 
-                var data = response.data;
-
-                // Show progress details
-                if (data.results) {
-                    for (var i = 0; i < data.results.length; i++) {
-                        self.addProgressDetail(
-                            data.results[i].message,
-                            data.results[i].status
-                        );
-                    }
+                var images = response.data.images;
+                if (!images || images.length === 0) {
+                    self.isProcessing = false;
+                    self.updateProgress(100, 'No se encontraron imagenes en la carpeta.');
+                    return;
                 }
 
-                self.updateProgress(100, wisAjax.strings.syncComplete);
-
-                if (data.summary) {
-                    self.showResults(data.summary);
-                }
+                // Store server images and process one by one to avoid timeout
+                self.serverImages = images;
+                self.processServerQueue(0, {
+                    total: images.length,
+                    success: 0,
+                    skipped: 0,
+                    no_match: 0,
+                    error: 0
+                });
             }).fail(function () {
                 self.isProcessing = false;
                 self.updateProgress(100, wisAjax.strings.error);
+            });
+        },
+
+        processServerQueue: function (index, summary) {
+            var self = this;
+
+            if (index >= this.serverImages.length) {
+                this.isProcessing = false;
+                this.showResults(summary);
+                return;
+            }
+
+            var img = this.serverImages[index];
+            var progress = Math.round(((index + 1) / this.serverImages.length) * 100);
+
+            this.updateProgress(
+                progress,
+                wisAjax.strings.processing + ' ' + (index + 1) + ' ' + wisAjax.strings.of + ' ' + this.serverImages.length + ': ' + img.filename
+            );
+
+            $.post(wisAjax.ajaxUrl, {
+                action: 'wis_process_single',
+                nonce: wisAjax.nonce,
+                file_path: img.path,
+                filename: img.filename
+            }, function (response) {
+                if (response.success && response.data) {
+                    var status = response.data.status;
+                    if (summary.hasOwnProperty(status)) {
+                        summary[status]++;
+                    }
+                    self.addProgressDetail(response.data.message, status);
+                } else {
+                    summary.error++;
+                    var msg = response.data && response.data.message
+                        ? response.data.message
+                        : wisAjax.strings.error;
+                    self.addProgressDetail(msg, 'error');
+                }
+            }).fail(function () {
+                summary.error++;
+                self.addProgressDetail(
+                    wisAjax.strings.error + ': ' + img.filename,
+                    'error'
+                );
+            }).always(function () {
+                self.processServerQueue(index + 1, summary);
             });
         },
 

@@ -163,30 +163,37 @@ class WIS_Sync_Engine {
      * @return int|false Product ID or false.
      */
     private function find_product_by_name( $name ) {
-        $args = array(
-            'post_type'      => 'product',
-            'title'          => $name,
-            'post_status'    => 'publish',
-            'posts_per_page' => 1,
-            'fields'         => 'ids',
+        global $wpdb;
+
+        // Use direct DB query for exact title match since WP_Query
+        // does not natively support exact 'title' parameter.
+        $product_id = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts} WHERE post_title = %s AND post_type = 'product' AND post_status = 'publish' LIMIT 1",
+                $name
+            )
         );
 
-        $products = get_posts( $args );
-
-        // Fallback: try a looser search if exact title match fails
-        if ( empty( $products ) ) {
-            $args = array(
-                'post_type'      => 'product',
-                's'              => $name,
-                'post_status'    => 'publish',
-                'posts_per_page' => 1,
-                'fields'         => 'ids',
-                'exact'          => true,
-            );
-            $products = get_posts( $args );
+        if ( $product_id ) {
+            return absint( $product_id );
         }
 
-        return ! empty( $products ) ? $products[0] : false;
+        // Fallback: try replacing hyphens/underscores with spaces for filenames like "My-Product.jpg"
+        $name_cleaned = str_replace( array( '-', '_' ), ' ', $name );
+        if ( $name_cleaned !== $name ) {
+            $product_id = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT ID FROM {$wpdb->posts} WHERE post_title = %s AND post_type = 'product' AND post_status = 'publish' LIMIT 1",
+                    $name_cleaned
+                )
+            );
+
+            if ( $product_id ) {
+                return absint( $product_id );
+            }
+        }
+
+        return false;
     }
 
     /**
