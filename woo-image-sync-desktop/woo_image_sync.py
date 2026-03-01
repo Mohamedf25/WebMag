@@ -43,6 +43,8 @@ def load_config():
         "store_url": "",
         "consumer_key": "",
         "consumer_secret": "",
+        "wp_user": "",
+        "wp_app_password": "",
         "folder_path": "",
         "match_by": "sku",
         "skip_existing": True,
@@ -65,9 +67,13 @@ def save_config(config):
 class WooCommerceClient:
     """Simple WooCommerce REST API client."""
 
-    def __init__(self, store_url, consumer_key, consumer_secret):
-        self.base_url = store_url.rstrip("/") + "/wp-json/wc/v3"
+    def __init__(self, store_url, consumer_key, consumer_secret,
+                 wp_user="", wp_app_password=""):
+        self.store_url = store_url.rstrip("/")
+        self.base_url = self.store_url + "/wp-json/wc/v3"
+        self.wp_base_url = self.store_url + "/wp-json/wp/v2"
         self.auth = (consumer_key, consumer_secret)
+        self.wp_auth = (wp_user, wp_app_password) if wp_user and wp_app_password else None
         self.session = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update({"User-Agent": "WooImageSync/1.0"})
@@ -185,123 +191,125 @@ class WooCommerceClient:
     def upload_image_to_product(self, product_id, image_path):
         """Upload an image and set it as the product's featured image.
 
-        Uses a temporary local HTTP server to serve the image file, then
-        passes the URL to the WooCommerce REST API which downloads it.
-        This is the most reliable method since WC consumer key/secret
-        does not authenticate against the WP REST API media endpoint.
+        Strategy:
+        1. Upload file to WordPress media library (via WP REST API)
+        2. Assign the uploaded media to the product (via WC REST API)
+
+        If WP REST API auth fails (WC keys don't work for /wp/v2/media),
+        falls back to Application Passwords if configured.
         """
         filename = os.path.basename(image_path)
         errors = []
 
-        # Method 1: Temporary HTTP server + WC API src URL
-        # WooCommerce accepts a publicly-accessible URL in images[].src
-        # and will download and import the image itself.
-        try:
-            success, message = self._upload_via_temp_server(
-                product_id, image_path, filename)
-            if success:
-                return True, message
-            errors.append(f"Metodo servidor temporal: {message}")
-        except Exception as e:
-            errors.append(f"Metodo servidor temporal: {str(e)}")
+        # Method 1: Upload to WP media library using Application Passwords
+        # (most reliable for remote WooCommerce stores)
+        if self.wp_auth:
+            try:
+                success, message = self._upload_via_wp_media(
+                    product_id, image_path, filename, self.wp_auth)
+                if success:
+                    return True, message
+                errors.append(f"App Password: {message}")
+            except Exception as e:
+                errors.append(f"App Password: {str(e)}")
 
-        # Method 2: Direct WP media upload (works if Application Passwords
-        # or a JWT auth plugin is configured)
+        # Method 2: Upload to WP media library using WC consumer keys as basic auth
+        # (works on some server configurations)
         try:
             success, message = self._upload_via_wp_media(
+                product_id, image_path, filename, self.auth)
+            if success:
+                return True, message
+            errors.append(f"WC Auth: {message}")
+        except Exception as e:
+            errors.append(f"WC Auth: {str(e)}")
+
+        # Method 3: Upload via WooCommerce plugin's own upload endpoint
+        # Uses the custom woo-image-sync plugin REST endpoint if installed
+        try:
+            success, message = self._upload_via_wc_plugin(
                 product_id, image_path, filename)
             if success:
                 return True, message
-            errors.append(f"Metodo WP Media: {message}")
+            errors.append(f"WC Plugin: {message}")
         except Exception as e:
-            errors.append(f"Metodo WP Media: {str(e)}")
+            errors.append(f"WC Plugin: {str(e)}")
 
-        # Method 3: Multipart form upload directly to WC API
-        try:
-            success, message = self._upload_via_multipart(
-                product_id, image_path, filename)
-            if success:
-                return True, message
-            errors.append(f"Metodo multipart: {message}")
-        except Exception as e:
-            errors.append(f"Metodo multipart: {str(e)}")
+        all_errors = " | ".join(errors)
+        return False, (
+            f"No se pudo subir la imagen. {all_errors}. "
+            "SOLUCION: En WordPress, ve a Usuarios > Tu perfil > "
+            "Contrasenas de aplicacion, crea una nueva y configurala "
+            "en la app (campos Usuario WP y Contrasena de Aplicacion)."
+        )
 
-        return False, "Todos los metodos fallaron: " + " | ".join(errors)
+    def _upload_via_wp_media(self, product_id, image_path, filename, auth):
+        """Upload image to WP media library, then assign to product."""
+        mime_types = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }
+        ext = os.path.splitext(filename)[1].lower()
+        mime_type = mime_types.get(ext, "image/jpeg")
 
-    def _upload_via_temp_server(self, product_id, image_path, filename):
-        """Upload by starting a temporary HTTP server to serve the image,
-        then telling WooCommerce to download it from that URL."""
-        import http.server
-        import socketserver
-        import urllib.parse
+        media_url = f"{self.wp_base_url}/media"
 
-        image_dir = os.path.dirname(os.path.abspath(image_path))
-        image_name = os.path.basename(image_path)
-
-        # Find a free port
-        server = None
-        port = 0
-        try:
-            handler = http.server.SimpleHTTPRequestHandler
-
-            class QuietHandler(handler):
-                """Suppress log output."""
-                def log_message(self, format, *args):
-                    pass
-
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, directory=image_dir, **kwargs)
-
-            server = socketserver.TCPServer(("0.0.0.0", 0), QuietHandler)
-            port = server.server_address[1]
-
-            # Start server in a background thread
-            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-            server_thread.start()
-
-            # Get the public IP or use the store URL's domain to determine reachability
-            # Since the local server won't be reachable from a remote WooCommerce store,
-            # this method only works if WooCommerce is on the same machine or network.
-            # We try it and fall through to other methods if it fails.
-            encoded_name = urllib.parse.quote(image_name)
-            image_url = f"http://localhost:{port}/{encoded_name}"
-
-            # Get existing gallery images to preserve them
-            existing_images = self._get_existing_images(product_id)
-
-            # Tell WooCommerce to download the image from our temp server
-            images_payload = [{"src": image_url, "name": filename}]
-            images_payload.extend(existing_images)
-
-            resp = self.session.put(
-                f"{self.base_url}/products/{product_id}",
-                json={"images": images_payload},
+        # Step 1: Upload file to media library using multipart form
+        with open(image_path, "rb") as img_file:
+            resp = requests.post(
+                media_url,
+                auth=auth,
+                files={
+                    "file": (filename, img_file, mime_type),
+                },
+                headers={"User-Agent": "WooImageSync/1.0"},
                 timeout=120,
             )
 
-            if resp.status_code == 200:
-                result = resp.json()
-                new_images = result.get("images", [])
-                if new_images and not any(
-                    "placeholder" in (img.get("src", "")).lower()
-                    for img in new_images[:1]
-                ):
-                    return True, "Imagen subida correctamente (via servidor temporal)"
-                else:
-                    return False, "WooCommerce no descargo la imagen"
-            else:
-                error_text = resp.text[:300] if resp.text else "Sin respuesta"
-                return False, f"Error HTTP {resp.status_code}: {error_text}"
+        if resp.status_code not in (200, 201):
+            error_msg = ""
+            try:
+                error_data = resp.json()
+                error_msg = error_data.get("message", resp.text[:200])
+            except Exception:
+                error_msg = resp.text[:200] if resp.text else f"HTTP {resp.status_code}"
+            return False, f"Error al subir a media: {error_msg}"
 
-        except Exception as e:
-            return False, str(e)
-        finally:
-            if server:
-                server.shutdown()
+        media_data = resp.json()
+        media_id = media_data.get("id")
+        media_src = media_data.get("source_url", "")
 
-    def _upload_via_wp_media(self, product_id, image_path, filename):
-        """Upload via WP REST API media endpoint.
-        Works if Application Passwords or JWT Auth is enabled."""
+        if not media_id:
+            return False, "No se obtuvo ID del archivo subido"
+
+        # Step 2: Assign the uploaded media to the product as featured image
+        existing_images = self._get_existing_images(product_id)
+        images_payload = [{"id": media_id, "src": media_src}]
+        images_payload.extend(existing_images)
+
+        update_resp = self.session.put(
+            f"{self.base_url}/products/{product_id}",
+            json={"images": images_payload},
+            timeout=30,
+        )
+
+        if update_resp.status_code == 200:
+            return True, f"Imagen subida y asignada (Media ID: {media_id})"
+        else:
+            error_msg = ""
+            try:
+                error_data = update_resp.json()
+                error_msg = error_data.get("message", update_resp.text[:200])
+            except Exception:
+                error_msg = update_resp.text[:200]
+            return False, f"Imagen subida (ID:{media_id}) pero error al asignar: {error_msg}"
+
+    def _upload_via_wc_plugin(self, product_id, image_path, filename):
+        """Upload via the WooCommerce Image Sync plugin's REST endpoint
+        (if the companion WP plugin is installed)."""
         mime_types = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
@@ -312,78 +320,29 @@ class WooCommerceClient:
         ext = os.path.splitext(filename)[1].lower()
         mime_type = mime_types.get(ext, "image/jpeg")
 
-        media_url = self.base_url.replace("/wc/v3", "/wp/v2") + "/media"
+        # The companion plugin exposes a custom endpoint
+        plugin_url = f"{self.store_url}/wp-json/wis/v1/upload"
 
-        try:
-            with open(image_path, "rb") as img_file:
-                file_data = img_file.read()
-
-            headers = {
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Type": mime_type,
-            }
-
-            resp = self.session.post(
-                media_url,
-                data=file_data,
-                headers=headers,
-                timeout=60,
+        with open(image_path, "rb") as img_file:
+            resp = requests.post(
+                plugin_url,
+                auth=self.auth,
+                files={"image": (filename, img_file, mime_type)},
+                data={"product_id": str(product_id)},
+                headers={"User-Agent": "WooImageSync/1.0"},
+                timeout=120,
             )
 
-            if resp.status_code in (200, 201):
-                media_data = resp.json()
-                media_id = media_data.get("id")
-                media_src = media_data.get("source_url", "")
-
-                existing_images = self._get_existing_images(product_id)
-                images_payload = [{"id": media_id, "src": media_src}]
-                images_payload.extend(existing_images)
-
-                update_resp = self.session.put(
-                    f"{self.base_url}/products/{product_id}",
-                    json={"images": images_payload},
-                    timeout=30,
-                )
-                update_resp.raise_for_status()
-                return True, f"Imagen subida correctamente (Media ID: {media_id})"
-            else:
-                return False, f"Error HTTP {resp.status_code}: {resp.text[:200]}"
-
-        except Exception as e:
-            return False, str(e)
-
-    def _upload_via_multipart(self, product_id, image_path, filename):
-        """Upload image using multipart form data to the WC products endpoint."""
-        mime_types = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-        }
-        ext = os.path.splitext(filename)[1].lower()
-        mime_type = mime_types.get(ext, "image/jpeg")
-
-        try:
-            # Try uploading the image as a file attachment to the product
-            with open(image_path, "rb") as img_file:
-                files = {"file": (filename, img_file, mime_type)}
-                # Use a separate request without the session's JSON headers
-                resp = requests.post(
-                    f"{self.base_url}/products/{product_id}",
-                    auth=self.auth,
-                    files=files,
-                    data={"images": json.dumps([{"name": filename}])},
-                    timeout=60,
-                )
-
-            if resp.status_code == 200:
-                return True, "Imagen subida correctamente (via multipart)"
-            else:
-                return False, f"Error HTTP {resp.status_code}: {resp.text[:200]}"
-
-        except Exception as e:
-            return False, str(e)
+        if resp.status_code in (200, 201):
+            try:
+                data = resp.json()
+                if data.get("success"):
+                    return True, data.get("message", "Imagen subida via plugin")
+                return False, data.get("message", "Error desconocido")
+            except Exception:
+                return True, "Imagen subida via plugin"
+        else:
+            return False, f"Plugin no disponible o error HTTP {resp.status_code}"
 
     def _get_existing_images(self, product_id):
         """Get existing gallery images for a product (excluding the first/featured)."""
@@ -395,15 +354,15 @@ class WooCommerceClient:
             if resp.status_code == 200:
                 product = resp.json()
                 images = product.get("images", [])
-                # Return all images except the first one (featured)
-                # Filter out placeholder images
+                # Filter out placeholder images, keep real ones
                 real_images = []
                 for img in images:
                     src = img.get("src", "")
                     if src and "placeholder" not in src.lower():
                         real_images.append({"id": img.get("id"), "src": src})
+                # Return all except the first (featured) since we're replacing it
                 if len(real_images) > 0:
-                    return real_images[1:]  # Skip the featured image
+                    return real_images[1:]
             return []
         except Exception:
             return []
@@ -494,57 +453,81 @@ class WooImageSyncApp:
                      "Permisos: Lectura/Escritura")
         ttk.Label(frame, text=help_text, foreground="gray",
                   justify=tk.LEFT).grid(row=5, column=0, columnspan=3,
-                                         sticky=tk.W, pady=(5, 15))
+                                         sticky=tk.W, pady=(5, 10))
+
+        # WordPress Application Password (for media upload)
+        ttk.Label(frame, text="Autenticacion WordPress (para subir imagenes)",
+                  font=("", 11, "bold")).grid(row=6, column=0, columnspan=3,
+                                               sticky=tk.W, pady=(5, 5))
+
+        ttk.Label(frame, text="Usuario WP:").grid(
+            row=7, column=0, sticky=tk.W, pady=5)
+        self.wp_user_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.wp_user_var, width=50).grid(
+            row=7, column=1, columnspan=2, sticky=tk.EW, pady=5, padx=(10, 0))
+
+        ttk.Label(frame, text="Contrasena App:").grid(
+            row=8, column=0, sticky=tk.W, pady=5)
+        self.wp_app_pass_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.wp_app_pass_var, width=50, show="*").grid(
+            row=8, column=1, columnspan=2, sticky=tk.EW, pady=5, padx=(10, 0))
+
+        wp_help = ("REQUERIDO para subir imagenes. En WordPress:\n"
+                   "Usuarios > Tu perfil > Contrasenas de aplicacion\n"
+                   "Crea una nueva con nombre 'Image Sync' y copia la contrasena")
+        ttk.Label(frame, text=wp_help, foreground="gray",
+                  justify=tk.LEFT).grid(row=9, column=0, columnspan=3,
+                                         sticky=tk.W, pady=(2, 10))
 
         # Separator
         ttk.Separator(frame, orient=tk.HORIZONTAL).grid(
-            row=6, column=0, columnspan=3, sticky=tk.EW, pady=10)
+            row=10, column=0, columnspan=3, sticky=tk.EW, pady=10)
 
         # Folder Path
         ttk.Label(frame, text="Carpeta de imagenes:").grid(
-            row=7, column=0, sticky=tk.W, pady=5)
+            row=11, column=0, sticky=tk.W, pady=5)
         self.folder_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.folder_var, width=40).grid(
-            row=7, column=1, sticky=tk.EW, pady=5, padx=(10, 5))
+            row=11, column=1, sticky=tk.EW, pady=5, padx=(10, 5))
         ttk.Button(frame, text="Examinar...", command=self.browse_folder).grid(
-            row=7, column=2, pady=5)
+            row=11, column=2, pady=5)
 
         # Match by
         ttk.Label(frame, text="Asociar por:").grid(
-            row=8, column=0, sticky=tk.W, pady=5)
+            row=12, column=0, sticky=tk.W, pady=5)
         self.match_var = tk.StringVar(value="sku")
         match_combo = ttk.Combobox(frame, textvariable=self.match_var,
                                     values=["sku", "id", "slug"],
                                     state="readonly", width=20)
-        match_combo.grid(row=8, column=1, sticky=tk.W, pady=5, padx=(10, 0))
+        match_combo.grid(row=12, column=1, sticky=tk.W, pady=5, padx=(10, 0))
 
         ttk.Label(frame, text="El nombre del archivo = SKU/ID/Slug del producto",
-                  foreground="gray").grid(row=9, column=1, sticky=tk.W, padx=(10, 0))
+                  foreground="gray").grid(row=13, column=1, sticky=tk.W, padx=(10, 0))
 
         # Skip existing
         self.skip_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="No subir si el producto ya tiene imagen",
                         variable=self.skip_var).grid(
-            row=10, column=0, columnspan=3, sticky=tk.W, pady=5)
+            row=14, column=0, columnspan=3, sticky=tk.W, pady=5)
 
         # Separator
         ttk.Separator(frame, orient=tk.HORIZONTAL).grid(
-            row=11, column=0, columnspan=3, sticky=tk.EW, pady=10)
+            row=15, column=0, columnspan=3, sticky=tk.EW, pady=10)
 
         # Date filter section
         ttk.Label(frame, text="Filtro por Fecha",
-                  font=("", 12, "bold")).grid(row=12, column=0, columnspan=3,
+                  font=("", 12, "bold")).grid(row=16, column=0, columnspan=3,
                                                sticky=tk.W, pady=(5, 5))
 
         self.date_filter_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame, text="Solo sincronizar imagenes desde una fecha",
                         variable=self.date_filter_var,
                         command=self._toggle_date_filter).grid(
-            row=13, column=0, columnspan=3, sticky=tk.W, pady=5)
+            row=17, column=0, columnspan=3, sticky=tk.W, pady=5)
 
         # Date input frame
         self.date_frame = ttk.Frame(frame)
-        self.date_frame.grid(row=14, column=0, columnspan=3, sticky=tk.W, pady=5)
+        self.date_frame.grid(row=18, column=0, columnspan=3, sticky=tk.W, pady=5)
 
         ttk.Label(self.date_frame, text="Desde:").pack(side=tk.LEFT)
 
@@ -570,11 +553,11 @@ class WooImageSyncApp:
         self.year_spin.pack(side=tk.LEFT)
 
         ttk.Label(frame, text="Solo se sincronizaran imagenes creadas o modificadas despues de esta fecha.",
-                  foreground="gray").grid(row=15, column=0, columnspan=3, sticky=tk.W, padx=(0, 0))
+                  foreground="gray").grid(row=19, column=0, columnspan=3, sticky=tk.W, padx=(0, 0))
 
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=16, column=0, columnspan=3, pady=15)
+        btn_frame.grid(row=20, column=0, columnspan=3, pady=15)
 
         ttk.Button(btn_frame, text="Probar Conexion",
                    command=self.test_connection).pack(side=tk.LEFT, padx=5)
@@ -584,7 +567,7 @@ class WooImageSyncApp:
         # Connection status
         self.status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.status_var,
-                  font=("", 10)).grid(row=17, column=0, columnspan=3, pady=5)
+                  font=("", 10)).grid(row=21, column=0, columnspan=3, pady=5)
 
         # Configure grid weights
         frame.columnconfigure(1, weight=1)
@@ -723,6 +706,8 @@ class WooImageSyncApp:
         self.url_var.set(self.config.get("store_url", ""))
         self.key_var.set(self.config.get("consumer_key", ""))
         self.secret_var.set(self.config.get("consumer_secret", ""))
+        self.wp_user_var.set(self.config.get("wp_user", ""))
+        self.wp_app_pass_var.set(self.config.get("wp_app_password", ""))
         self.folder_var.set(self.config.get("folder_path", ""))
         self.match_var.set(self.config.get("match_by", "sku"))
         self.skip_var.set(self.config.get("skip_existing", True))
@@ -754,6 +739,8 @@ class WooImageSyncApp:
             "store_url": self.url_var.get().strip(),
             "consumer_key": self.key_var.get().strip(),
             "consumer_secret": self.secret_var.get().strip(),
+            "wp_user": self.wp_user_var.get().strip(),
+            "wp_app_password": self.wp_app_pass_var.get().strip(),
             "folder_path": self.folder_var.get().strip(),
             "match_by": self.match_var.get(),
             "skip_existing": self.skip_var.get(),
@@ -778,7 +765,9 @@ class WooImageSyncApp:
         self.status_var.set("Probando conexion...")
         self.root.update()
 
-        client = WooCommerceClient(url, key, secret)
+        wp_user = self.wp_user_var.get().strip()
+        wp_app_pass = self.wp_app_pass_var.get().strip()
+        client = WooCommerceClient(url, key, secret, wp_user, wp_app_pass)
         success, message = client.test_connection()
 
         if success:
@@ -796,6 +785,8 @@ class WooImageSyncApp:
         url = self.url_var.get().strip()
         key = self.key_var.get().strip()
         secret = self.secret_var.get().strip()
+        wp_user = self.wp_user_var.get().strip()
+        wp_app_pass = self.wp_app_pass_var.get().strip()
 
         if not url or not key or not secret:
             messagebox.showwarning("Datos incompletos",
@@ -803,7 +794,7 @@ class WooImageSyncApp:
             return None
 
         if not self.client:
-            self.client = WooCommerceClient(url, key, secret)
+            self.client = WooCommerceClient(url, key, secret, wp_user, wp_app_pass)
 
         return self.client
 
