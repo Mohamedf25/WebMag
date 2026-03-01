@@ -63,10 +63,12 @@ function wis_init() {
     require_once WIS_PLUGIN_DIR . 'includes/class-wis-sync-engine.php';
     require_once WIS_PLUGIN_DIR . 'includes/class-wis-admin.php';
     require_once WIS_PLUGIN_DIR . 'includes/class-wis-ajax-handler.php';
+    require_once WIS_PLUGIN_DIR . 'includes/class-wis-rest-api.php';
 
     // Initialize classes
     new WIS_Admin();
     new WIS_Ajax_Handler();
+    new WIS_REST_API();
 }
 add_action( 'plugins_loaded', 'wis_init' );
 

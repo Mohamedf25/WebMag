@@ -191,18 +191,27 @@ class WooCommerceClient:
     def upload_image_to_product(self, product_id, image_path):
         """Upload an image and set it as the product's featured image.
 
-        Strategy:
-        1. Upload file to WordPress media library (via WP REST API)
-        2. Assign the uploaded media to the product (via WC REST API)
-
-        If WP REST API auth fails (WC keys don't work for /wp/v2/media),
-        falls back to Application Passwords if configured.
+        Strategy (in order of preference):
+        1. WIS Plugin endpoint - uses same WC consumer keys, most reliable
+        2. WP Media Library with Application Passwords
+        3. WP Media Library with WC consumer keys as basic auth
         """
         filename = os.path.basename(image_path)
         errors = []
 
-        # Method 1: Upload to WP media library using Application Passwords
-        # (most reliable for remote WooCommerce stores)
+        # Method 1 (PRIMARY): Upload via WIS plugin REST endpoint
+        # Uses the same WC consumer key/secret - no extra credentials needed
+        # Requires the woo-image-sync plugin to be installed in WordPress
+        try:
+            success, message = self._upload_via_wc_plugin(
+                product_id, image_path, filename)
+            if success:
+                return True, message
+            errors.append(f"Plugin WIS: {message}")
+        except Exception as e:
+            errors.append(f"Plugin WIS: {str(e)}")
+
+        # Method 2: Upload to WP media library using Application Passwords
         if self.wp_auth:
             try:
                 success, message = self._upload_via_wp_media(
@@ -213,8 +222,7 @@ class WooCommerceClient:
             except Exception as e:
                 errors.append(f"App Password: {str(e)}")
 
-        # Method 2: Upload to WP media library using WC consumer keys as basic auth
-        # (works on some server configurations)
+        # Method 3: Upload to WP media library using WC consumer keys as basic auth
         try:
             success, message = self._upload_via_wp_media(
                 product_id, image_path, filename, self.auth)
@@ -224,23 +232,11 @@ class WooCommerceClient:
         except Exception as e:
             errors.append(f"WC Auth: {str(e)}")
 
-        # Method 3: Upload via WooCommerce plugin's own upload endpoint
-        # Uses the custom woo-image-sync plugin REST endpoint if installed
-        try:
-            success, message = self._upload_via_wc_plugin(
-                product_id, image_path, filename)
-            if success:
-                return True, message
-            errors.append(f"WC Plugin: {message}")
-        except Exception as e:
-            errors.append(f"WC Plugin: {str(e)}")
-
         all_errors = " | ".join(errors)
         return False, (
             f"No se pudo subir la imagen. {all_errors}. "
-            "SOLUCION: En WordPress, ve a Usuarios > Tu perfil > "
-            "Contrasenas de aplicacion, crea una nueva y configurala "
-            "en la app (campos Usuario WP y Contrasena de Aplicacion)."
+            "SOLUCION: Instala el plugin 'WooCommerce Image Sync' en WordPress "
+            "(Plugins > Anadir nuevo > Subir plugin) y vuelve a intentar."
         )
 
     def _upload_via_wp_media(self, product_id, image_path, filename, auth):
@@ -308,8 +304,13 @@ class WooCommerceClient:
             return False, f"Imagen subida (ID:{media_id}) pero error al asignar: {error_msg}"
 
     def _upload_via_wc_plugin(self, product_id, image_path, filename):
-        """Upload via the WooCommerce Image Sync plugin's REST endpoint
-        (if the companion WP plugin is installed)."""
+        """Upload via the WooCommerce Image Sync plugin's REST endpoint.
+
+        This endpoint authenticates using WC consumer key/secret (same
+        credentials used for the WC REST API), so no extra WordPress
+        credentials are needed. Requires the woo-image-sync plugin
+        to be installed and activated in WordPress.
+        """
         mime_types = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
@@ -320,12 +321,22 @@ class WooCommerceClient:
         ext = os.path.splitext(filename)[1].lower()
         mime_type = mime_types.get(ext, "image/jpeg")
 
-        # The companion plugin exposes a custom endpoint
+        # The companion plugin exposes a custom endpoint that validates
+        # WC consumer keys directly against the woocommerce_api_keys table
         plugin_url = f"{self.store_url}/wp-json/wis/v1/upload"
+
+        # Pass consumer key/secret both as basic auth AND as query params
+        # for maximum compatibility (some servers strip basic auth headers)
+        ck, cs = self.auth
+        params = {
+            "consumer_key": ck,
+            "consumer_secret": cs,
+        }
 
         with open(image_path, "rb") as img_file:
             resp = requests.post(
                 plugin_url,
+                params=params,
                 auth=self.auth,
                 files={"image": (filename, img_file, mime_type)},
                 data={"product_id": str(product_id)},
@@ -342,7 +353,15 @@ class WooCommerceClient:
             except Exception:
                 return True, "Imagen subida via plugin"
         else:
-            return False, f"Plugin no disponible o error HTTP {resp.status_code}"
+            error_msg = ""
+            try:
+                data = resp.json()
+                error_msg = data.get("message", "")
+            except Exception:
+                pass
+            if not error_msg:
+                error_msg = f"HTTP {resp.status_code}"
+            return False, f"Plugin: {error_msg}"
 
     def _get_existing_images(self, product_id):
         """Get existing gallery images for a product (excluding the first/featured)."""
