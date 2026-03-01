@@ -11,6 +11,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
+from datetime import datetime, date
 
 try:
     import requests
@@ -45,6 +46,8 @@ def load_config():
         "folder_path": "",
         "match_by": "sku",
         "skip_existing": True,
+        "filter_by_date": False,
+        "filter_date": "",
     }
 
 
@@ -407,11 +410,56 @@ class WooImageSyncApp:
         self.skip_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="No subir si el producto ya tiene imagen",
                         variable=self.skip_var).grid(
-            row=10, column=0, columnspan=3, sticky=tk.W, pady=10)
+            row=10, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        # Separator
+        ttk.Separator(frame, orient=tk.HORIZONTAL).grid(
+            row=11, column=0, columnspan=3, sticky=tk.EW, pady=10)
+
+        # Date filter section
+        ttk.Label(frame, text="Filtro por Fecha",
+                  font=("", 12, "bold")).grid(row=12, column=0, columnspan=3,
+                                               sticky=tk.W, pady=(5, 5))
+
+        self.date_filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Solo sincronizar imagenes desde una fecha",
+                        variable=self.date_filter_var,
+                        command=self._toggle_date_filter).grid(
+            row=13, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        # Date input frame
+        self.date_frame = ttk.Frame(frame)
+        self.date_frame.grid(row=14, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        ttk.Label(self.date_frame, text="Desde:").pack(side=tk.LEFT)
+
+        # Day
+        ttk.Label(self.date_frame, text="  Dia:").pack(side=tk.LEFT, padx=(10, 2))
+        self.day_var = tk.StringVar(value=str(date.today().day))
+        self.day_spin = ttk.Spinbox(self.date_frame, from_=1, to=31, width=4,
+                                     textvariable=self.day_var, state=tk.DISABLED)
+        self.day_spin.pack(side=tk.LEFT)
+
+        # Month
+        ttk.Label(self.date_frame, text="  Mes:").pack(side=tk.LEFT, padx=(10, 2))
+        self.month_var = tk.StringVar(value=str(date.today().month))
+        self.month_spin = ttk.Spinbox(self.date_frame, from_=1, to=12, width=4,
+                                       textvariable=self.month_var, state=tk.DISABLED)
+        self.month_spin.pack(side=tk.LEFT)
+
+        # Year
+        ttk.Label(self.date_frame, text="  Ano:").pack(side=tk.LEFT, padx=(10, 2))
+        self.year_var = tk.StringVar(value=str(date.today().year))
+        self.year_spin = ttk.Spinbox(self.date_frame, from_=2020, to=2030, width=6,
+                                      textvariable=self.year_var, state=tk.DISABLED)
+        self.year_spin.pack(side=tk.LEFT)
+
+        ttk.Label(frame, text="Solo se sincronizaran imagenes creadas o modificadas despues de esta fecha.",
+                  foreground="gray").grid(row=15, column=0, columnspan=3, sticky=tk.W, padx=(0, 0))
 
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=11, column=0, columnspan=3, pady=15)
+        btn_frame.grid(row=16, column=0, columnspan=3, pady=15)
 
         ttk.Button(btn_frame, text="Probar Conexion",
                    command=self.test_connection).pack(side=tk.LEFT, padx=5)
@@ -421,7 +469,7 @@ class WooImageSyncApp:
         # Connection status
         self.status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.status_var,
-                  font=("", 10)).grid(row=12, column=0, columnspan=3, pady=5)
+                  font=("", 10)).grid(row=17, column=0, columnspan=3, pady=5)
 
         # Configure grid weights
         frame.columnconfigure(1, weight=1)
@@ -530,6 +578,31 @@ class WooImageSyncApp:
         if folder:
             self.folder_var.set(folder)
 
+    def _toggle_date_filter(self):
+        """Enable or disable date filter inputs."""
+        if self.date_filter_var.get():
+            self.day_spin.config(state=tk.NORMAL)
+            self.month_spin.config(state=tk.NORMAL)
+            self.year_spin.config(state=tk.NORMAL)
+        else:
+            self.day_spin.config(state=tk.DISABLED)
+            self.month_spin.config(state=tk.DISABLED)
+            self.year_spin.config(state=tk.DISABLED)
+
+    def _get_filter_date(self):
+        """Get the filter date as a datetime object, or None if disabled."""
+        if not self.date_filter_var.get():
+            return None
+        try:
+            day = int(self.day_var.get())
+            month = int(self.month_var.get())
+            year = int(self.year_var.get())
+            return datetime(year, month, day)
+        except (ValueError, TypeError):
+            messagebox.showerror("Fecha invalida",
+                                 "La fecha ingresada no es valida. Verifica dia, mes y ano.")
+            return None
+
     def load_config_to_ui(self):
         """Load saved config into UI fields."""
         self.url_var.set(self.config.get("store_url", ""))
@@ -538,9 +611,30 @@ class WooImageSyncApp:
         self.folder_var.set(self.config.get("folder_path", ""))
         self.match_var.set(self.config.get("match_by", "sku"))
         self.skip_var.set(self.config.get("skip_existing", True))
+        self.date_filter_var.set(self.config.get("filter_by_date", False))
+        saved_date = self.config.get("filter_date", "")
+        if saved_date:
+            try:
+                d = datetime.strptime(saved_date, "%Y-%m-%d")
+                self.day_var.set(str(d.day))
+                self.month_var.set(str(d.month))
+                self.year_var.set(str(d.year))
+            except ValueError:
+                pass
+        self._toggle_date_filter()
 
     def save_configuration(self):
         """Save current configuration."""
+        filter_date_str = ""
+        if self.date_filter_var.get():
+            try:
+                day = int(self.day_var.get())
+                month = int(self.month_var.get())
+                year = int(self.year_var.get())
+                filter_date_str = f"{year:04d}-{month:02d}-{day:02d}"
+            except (ValueError, TypeError):
+                pass
+
         self.config = {
             "store_url": self.url_var.get().strip(),
             "consumer_key": self.key_var.get().strip(),
@@ -548,6 +642,8 @@ class WooImageSyncApp:
             "folder_path": self.folder_var.get().strip(),
             "match_by": self.match_var.get(),
             "skip_existing": self.skip_var.get(),
+            "filter_by_date": self.date_filter_var.get(),
+            "filter_date": filter_date_str,
         }
         save_config(self.config)
         self.status_var.set("Configuracion guardada correctamente")
@@ -614,22 +710,40 @@ class WooImageSyncApp:
         for item in self.tree.get_children():
             self.tree.delete(item)
 
+        # Get date filter
+        filter_date = self._get_filter_date()
+        if self.date_filter_var.get() and filter_date is None:
+            return  # Invalid date entered
+
         # Scan for images
         images = []
+        skipped_by_date = 0
         for filename in sorted(os.listdir(folder)):
             ext = os.path.splitext(filename)[1].lower()
             if ext in ALLOWED_EXTENSIONS:
+                filepath = os.path.join(folder, filename)
+
+                # Apply date filter
+                if filter_date:
+                    file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                    if file_mtime < filter_date:
+                        skipped_by_date += 1
+                        continue
+
                 name_without_ext = os.path.splitext(filename)[0]
                 images.append({
                     "filename": filename,
-                    "path": os.path.join(folder, filename),
+                    "path": filepath,
                     "identifier": name_without_ext,
                 })
 
         if not images:
+            date_msg = ""
+            if filter_date:
+                date_msg = f" (se omitieron {skipped_by_date} por fecha)"
             self.info_label.config(
-                text="No se encontraron imagenes en la carpeta seleccionada.")
-            self.log(f"Escaneo: 0 imagenes en {folder}")
+                text=f"No se encontraron imagenes en la carpeta seleccionada{date_msg}.")
+            self.log(f"Escaneo: 0 imagenes en {folder}{date_msg}")
             return
 
         # Add to tree
@@ -641,11 +755,14 @@ class WooImageSyncApp:
                 "Sin escanear"
             ))
 
+        date_msg = ""
+        if filter_date:
+            date_msg = f" ({skipped_by_date} omitidas por fecha anterior a {filter_date.strftime('%d/%m/%Y')})"
         self.info_label.config(
-            text=f"Se encontraron {len(images)} imagenes. "
+            text=f"Se encontraron {len(images)} imagenes{date_msg}. "
                  f"Haz clic en 'Sincronizar' para iniciar.")
         self.sync_btn.config(state=tk.NORMAL)
-        self.log(f"Escaneo: {len(images)} imagenes encontradas en {folder}")
+        self.log(f"Escaneo: {len(images)} imagenes encontradas en {folder}{date_msg}")
 
     def start_sync(self):
         """Start the sync process in a background thread."""
